@@ -1,4 +1,4 @@
-name: Complete Security Scanning Pipeline
+name: Complete Security Scanning - Secrets & Dependencies
 
 on:
   push:
