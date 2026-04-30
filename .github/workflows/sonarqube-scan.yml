@@ -1,0 +1,136 @@
+name: SonarQube SAST Scan
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+
+    services:
+      sonarqube:
+        image: sonarqube:latest
+        ports:
+          - 9000:9000
+        env:
+          SONAR_ES_BOOTSTRAP_CHECKS_DISABLED: "true"
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/api/system/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint 2>/dev/null || echo "No lint script configured"
+
+      - name: Wait for SonarQube to be ready
+        run: |
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/api/system/health; then
+              echo "SonarQube is ready"
+              exit 0
+            fi
+            echo "Waiting for SonarQube... ($i/30)"
+            sleep 2
+          done
+          echo "SonarQube failed to start"
+          exit 1
+
+      - name: Create SonarQube project
+        run: |
+          curl -X POST "http://localhost:9000/api/projects/create" \
+            -u admin:admin \
+            -d "project=vulnerable-app&name=Vulnerable%20App" || true
+
+      - name: Run SonarQube Scanner
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_HOST_URL: http://localhost:9000
+          SONAR_LOGIN: admin
+          SONAR_PASSWORD: admin
+        with:
+          args: >
+            -Dsonar.projectKey=vulnerable-app
+            -Dsonar.projectName=Vulnerable App
+            -Dsonar.sources=.
+            -Dsonar.exclusions=node_modules/**,test/**,.git/**
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+      - name: Wait for SonarQube analysis to complete
+        run: |
+          for i in {1..60}; do
+            STATUS=$(curl -s -u admin:admin \
+              "http://localhost:9000/api/ce/activity?projectKey=vulnerable-app" | \
+              grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+            if [ "$STATUS" = "SUCCESS" ] || [ "$STATUS" = "FAILED" ]; then
+              echo "Analysis completed with status: $STATUS"
+              break
+            fi
+            echo "Waiting for analysis... ($i/60)"
+            sleep 2
+          done
+
+      - name: Check SonarQube Quality Gate
+        run: |
+          QUALITY_GATE=$(curl -s -u admin:admin \
+            "http://localhost:9000/api/qualitygates/project_status?projectKey=vulnerable-app" | \
+            grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+
+          echo "Quality Gate Status: $QUALITY_GATE"
+
+          if [ "$QUALITY_GATE" = "ERROR" ]; then
+            echo "❌ Quality Gate FAILED"
+            exit 1
+          else
+            echo "✅ Quality Gate PASSED"
+            exit 0
+          fi
+
+      - name: Generate SonarQube Report
+        if: always()
+        run: |
+          echo "=== SonarQube Analysis Report ===" > sonarqube-report.txt
+          curl -s -u admin:admin \
+            "http://localhost:9000/api/measures/component?component=vulnerable-app&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
+            >> sonarqube-report.txt 2>&1 || echo "Report generation failed"
+          cat sonarqube-report.txt
+
+      - name: Upload SonarQube Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: sonarqube-report
+          path: sonarqube-report.txt
+
+      - name: Comment PR with SonarQube Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('sonarqube-report.txt', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🔍 SonarQube SAST Analysis\n\n\`\`\`\n${report}\n\`\`\``
+            });

@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  sonarqube:
+    image: sonarqube:latest
+    container_name: sonarqube-vulnerable-app
+    ports:
+      - "9000:9000"
+      - "9092:9092"
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/sonarqube
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: sonar
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLED: "true"
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+    depends_on:
+      - postgres
+    networks:
+      - sonarqube-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/system/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:13
+    container_name: sonarqube-postgres
+    environment:
+      POSTGRES_DB: sonarqube
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - sonarqube-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+  postgres_data:
+
+networks:
+  sonarqube-network:
+    driver: bridge
