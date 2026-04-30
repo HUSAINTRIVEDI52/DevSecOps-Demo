@@ -10,7 +10,11 @@
     "sonar": "sonar-scanner",
     "sonar:setup": "node scripts/setup-sonarqube.js",
     "lint": "eslint . --ext .js 2>/dev/null || true",
-    "security-check": "npm audit --audit-level=moderate"
+    "security-check": "npm audit --audit-level=moderate",
+    "dependency-check": "node scripts/run-dependency-check.js",
+    "dependency-check:docker": "docker run --rm -v $(pwd):/src owasp/dependency-check --scan /src --format JSON --project 'Vulnerable App'",
+    "security-scan": "npm run security-check && npm run dependency-check",
+    "full-scan": "npm run lint && npm run security-check && npm run sonar && npm run dependency-check"
   },
   "dependencies": {
     "express": "^4.18.2",
