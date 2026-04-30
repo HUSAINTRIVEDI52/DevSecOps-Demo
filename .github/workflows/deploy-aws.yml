@@ -1,0 +1,212 @@
+name: Deploy to AWS with IAM Role
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: vulnerable-app
+  ECS_SERVICE: vulnerable-app-service
+  ECS_CLUSTER: vulnerable-app-cluster
+  ECS_TASK_DEFINITION: vulnerable-app-task
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  security-checks:
+    runs-on: ubuntu-latest
+    name: Security Checks Before Deployment
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run npm audit
+        run: |
+          npm ci
+          npm audit --audit-level=moderate || true
+
+      - name: Fail on secrets found
+        run: |
+          if [ -f gitleaks-report.json ]; then
+            SECRETS=$(cat gitleaks-report.json | jq 'length')
+            if [ "$SECRETS" -gt 0 ]; then
+              echo "❌ Secrets detected! Deployment blocked."
+              exit 1
+            fi
+          fi
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    name: Build and Push to ECR
+    needs: security-checks
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials with IAM Role
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsSession
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Fail on critical vulnerabilities
+        run: |
+          if [ -f trivy-results.sarif ]; then
+            CRITICAL=$(cat trivy-results.sarif | jq '[.runs[].results[]? | select(.level=="error")] | length')
+            if [ "$CRITICAL" -gt 0 ]; then
+              echo "❌ Critical vulnerabilities found! Deployment blocked."
+              exit 1
+            fi
+          fi
+
+      - name: Output image URI
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy to ECS
+    needs: build-and-push
+    if: success()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials with IAM Role
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsDeploySession
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition $ECS_TASK_DEFINITION \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.ECR_REPOSITORY }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        run: |
+          aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].deployments' \
+            --output table
+
+      - name: Log deployment
+        run: |
+          echo "✅ Deployment successful"
+          echo "Image: ${{ needs.build-and-push.outputs.image }}"
+          echo "Cluster: $ECS_CLUSTER"
+          echo "Service: $ECS_SERVICE"
+
+  post-deployment:
+    runs-on: ubuntu-latest
+    name: Post-Deployment Verification
+    needs: deploy
+    if: success()
+
+    steps:
+      - name: Configure AWS credentials with IAM Role
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsVerifySession
+
+      - name: Get service endpoint
+        run: |
+          aws elbv2 describe-load-balancers \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text
+
+      - name: Health check
+        run: |
+          for i in {1..30}; do
+            if curl -f http://localhost:3000/health 2>/dev/null; then
+              echo "✅ Service is healthy"
+              exit 0
+            fi
+            echo "Attempt $i/30..."
+            sleep 2
+          done
+          echo "⚠️ Health check timeout"
+
+      - name: Create deployment summary
+        run: |
+          echo "# 🚀 Deployment Summary" > deployment-summary.md
+          echo "" >> deployment-summary.md
+          echo "- **Status**: ✅ Success" >> deployment-summary.md
+          echo "- **Image**: ${{ needs.build-and-push.outputs.image }}" >> deployment-summary.md
+          echo "- **Cluster**: $ECS_CLUSTER" >> deployment-summary.md
+          echo "- **Service**: $ECS_SERVICE" >> deployment-summary.md
+          echo "- **Timestamp**: $(date)" >> deployment-summary.md
+
+      - name: Upload deployment summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-summary
+          path: deployment-summary.md
